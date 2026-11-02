@@ -127,14 +127,17 @@ public class RestartBlocking {
 		final int task;
 		final double [] start_range;
 		final double [] stop_range;
+		final double [] new_value;
 
 		public Blocker(int id){
 			this.task = id;
 			this.start_range = new double[num_queries_per_task];
 			this.stop_range  = new double[num_queries_per_task];
+			this.new_value   = new double[num_queries_per_task];
 			for(int q=0;q<num_queries_per_task;q++) {
 				stop_range[q]  = rand.nextDouble()*max_value;
 				start_range[q] = rand.nextDouble()*stop_range[q];
+				new_value[q]   = rand.nextDouble()*max_value;
 			}
 		}
 
@@ -152,7 +155,8 @@ public class RestartBlocking {
 					attempts++;
 					try (PreparedStatement ps = con.prepareStatement("UPDATE blocking_data SET data_value = ?,  modified_by = "+task+" WHERE data_value >= ? AND data_value <= ?;",ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_UPDATABLE)) {
 						for (int q = 0; q < num_queries_per_task; q++) {//I want to execute num_queries_per_task update queries
-							ps.setDouble(1, (float) (rand.nextDouble()*max_value));//some value, which one is not important.
+							//every retry writes the SAME logical values
+							ps.setDouble(1, new_value[q]);
 							ps.setDouble(2, start_range[q]);
 							ps.setDouble(3, stop_range[q]);
 							ps.execute();
@@ -162,7 +166,7 @@ public class RestartBlocking {
 					} catch (SQLException e) {
 						//the aborted transaction stays open until we roll back, otherwise every retry fails with "current transaction is aborted"
 						con.rollback();
-		                /** 40P01 = deadlock detected -> try again */
+		                // 40P01 = deadlock detected -> try again
 						if (! "40P01".equals(e.getSQLState())) {
 							throw e;
 						}

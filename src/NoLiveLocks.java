@@ -133,14 +133,17 @@ public class NoLiveLocks {
 		final int task;
 		final double [] start_range;
 		final double [] stop_range;
+		final double [] new_value;
 
 		public Blocker(int id){
 			this.task = id;
 			this.start_range = new double[num_queries_per_task];
 			this.stop_range  = new double[num_queries_per_task];
+			this.new_value   = new double[num_queries_per_task];
 			for(int q=0;q<num_queries_per_task;q++) {
 				stop_range[q]  = rand.nextDouble()*max_value;
 				start_range[q] = rand.nextDouble()*stop_range[q];
+				new_value[q]   = rand.nextDouble()*max_value;
 			}
 		}
 
@@ -161,8 +164,6 @@ public class NoLiveLocks {
 						 PreparedStatement lock = con.prepareStatement(lockAllRowsSql());
 						 PreparedStatement ps = con.prepareStatement("UPDATE blocking_data SET data_value = ?,  modified_by = "+task+" WHERE data_value >= ? AND data_value <= ?;",ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_UPDATABLE)) {
 						if (exclusive) {
-							//starvation guard: wait until all running transactions on the table are done and keep new ones out.
-							//we hold no other lock while waiting, so this cannot be part of a deadlock cycle
 							st.execute("LOCK TABLE blocking_data IN EXCLUSIVE MODE");
 							escalations.incrementAndGet();
 						} else {
@@ -173,11 +174,13 @@ public class NoLiveLocks {
 								lock.setDouble(2*q+1, start_range[q]);
 								lock.setDouble(2*q+2, stop_range[q]);
 							}
-							lock.executeQuery().close();
+							lock.executeQuery()
+								.close();
 						}
 
 						for (int q = 0; q < num_queries_per_task; q++) {//I want to execute num_queries_per_task update queries
-							ps.setDouble(1, (float) (rand.nextDouble()*max_value));//some value, which one is not important.
+							//every retry writes the SAME logical values
+							ps.setDouble(1, new_value[q]);
 							ps.setDouble(2, start_range[q]);
 							ps.setDouble(3, stop_range[q]);
 							ps.execute();
@@ -212,7 +215,7 @@ public class NoLiveLocks {
 			}
 		}
 
-		/** SELECT ... FOR UPDATE over the union of all ranges of this task, rows locked in data_id order */
+		// SELECT ... FOR UPDATE over the union of all ranges of this task, rows locked in data_id order
 		String lockAllRowsSql() {
 			StringBuilder sb = new StringBuilder("SELECT data_id FROM blocking_data WHERE ");
 			for (int q = 0; q < num_queries_per_task; q++) {
