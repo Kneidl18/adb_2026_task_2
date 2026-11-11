@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.LongAdder;
  *   <li>Workload: every transaction of the stream is a 3-point read (60 %), an insert (10 %), a full
  *       table scan (10 %) or a 3-row write (20 %), see {@link Txn#at}.</li>
  *   <li>Continuous stream: closed loop. Each of the T worker threads starts the next transaction of the
- *       stream as soon as its previous one committed, so exactly T transactions are in flight.</li>
+ *       stream as soon as its previous one committed, so at most T transactions are in flight.</li>
  *   <li>All transactions commit: deadlocks/serialization failures are retried with the same values;
  *       after {@link #MAX_RETRIES} aborts a write runs under an exclusive table lock (no starvation).</li>
  *   <li>Serial execution is the same code with {@code --threads 1}.</li>
@@ -64,14 +64,20 @@ public class Benchmark {
 
 	enum Type { READ, INSERT, SCAN, WRITE }
 
+	static boolean useAutocommit(Set<Opt> opts, Type type) {
+		return opts.contains(Opt.AUTOCOMMIT) && (type == Type.INSERT || type == Type.SCAN);
+	}
+
 	/** The optimizations that can be switched on individually (ablation). */
 	enum Opt {
 		/** prepare each statement once per connection instead of once per transaction */
 		STMT,
 		/** buffer the console output instead of flushing every printed sum */
 		PRINT,
-		/** single-statement and read-only transactions in autocommit: saves the COMMIT round trip */
+		/** single-statement INSERT/SCAN only; multi-point READ keeps its transaction boundary */
 		AUTOCOMMIT,
+		/** mark READ/SCAN transactions read-only through JDBC */
+		READONLY,
 		/** synchronous_commit = off: a commit does not wait for the WAL flush */
 		ASYNC
 	}
@@ -81,6 +87,7 @@ public class Benchmark {
 	 * strategy works off exactly the same stream, and a retry re-executes the same values.
 	 */
 	record Txn(int id, Type type, int[] dataIds, double[] values) {
+		int insertId() { return Math.addExact(NUM_TUPLE, id); }
 		static Txn at(long seed, long index) {
 			SplittableRandom rnd = new SplittableRandom(seed + index * 0x9E3779B97F4A7C15L);
 			double p = rnd.nextDouble();
@@ -121,6 +128,8 @@ public class Benchmark {
 					default -> throw new IllegalArgumentException("unknown flag " + flag + "\n" + USAGE);
 				}
 			}
+			if (duration < 1 || warmup < 0 || count < 0 || count > Integer.MAX_VALUE - NUM_TUPLE)
+				throw new IllegalArgumentException("invalid duration, warmup or count");
 			if (threads < 1) throw new IllegalArgumentException("--threads must be >= 1");
 			return new Config(threads, duration, count, warmup, seed, opts, label, csv, timeline);
 		}
@@ -145,15 +154,16 @@ public class Benchmark {
 			  --count N       instead: measure until the first N stream transactions committed
 			  --warmup S      warm-up seconds before measuring, not counted (default 5)
 			  --seed X        stream seed (default 42)
-			  --opt LIST      none | all | comma list of stmt,print,autocommit,async (default none)
+			  --opt LIST      none | all | comma list of stmt,print,autocommit,readonly,async (default none)
 			  --label TEXT    free text for the CSV row
 			  --csv FILE      append the result row here (default results/runs.csv)
 			  --timeline FILE write one row per second (for scripts/live_plot.py)
 			Sums of reads and scans go to stdout, status lines to stderr.""";
 
-	/** Commit counters; {@code started - committed} is the number of transactions in flight. */
+	/** Commit counters and an atomic gauge for tasks currently being processed. */
 	static final class Stats {
 		final LongAdder started = new LongAdder();
+		final AtomicInteger active = new AtomicInteger();
 		final LongAdder[] committed = { new LongAdder(), new LongAdder(), new LongAdder(), new LongAdder() };
 		final LongAdder retries = new LongAdder();
 		final LongAdder escalations = new LongAdder();
@@ -180,7 +190,6 @@ public class Benchmark {
 	final Config cfg;
 	final Stats stats = new Stats();
 	final AtomicLong nextIndex = new AtomicLong();
-	final AtomicInteger nextInsertId = new AtomicInteger(NUM_TUPLE);
 	final PrintStream out;
 	volatile Phase phase;
 	volatile boolean aborted;
@@ -222,7 +231,16 @@ public class Benchmark {
 			if (cfg.warmupSec() > 0) {
 				nextIndex.set(WARMUP_STREAM_OFFSET);
 				runPhase(workers, new Phase("warmup", Long.MAX_VALUE, deadline(cfg.warmupSec())));
+				out.flush();
+				for (Worker w : workers) w.resetAfterWarmup();
+				recreateTable(); // same seeded data, no warm-up inserts/updates/bloat in measurement
 			}
+			if ("1".equals(System.getenv("BENCHMARK_ANALYZE"))) {
+				try (Statement st = workers.get(0).con.createStatement()) {
+					st.execute("SELECT pg_stat_statements_reset()");
+				}
+			}
+			for (Worker w : workers) w.con.setClientInfo("ApplicationName", "adb-task-3-measure");
 			nextIndex.set(0);
 			Phase measure = cfg.count() > 0
 					? new Phase("measure", cfg.count(), Long.MAX_VALUE)
@@ -269,7 +287,7 @@ public class Benchmark {
 
 	void runPhase(List<Worker> workers, Phase p) throws InterruptedException {
 		phase = p;
-		List<Thread> threads = workers.stream().map(w -> new Thread(w, "worker-" + w.number)).toList();
+		List<Thread> threads = workers.stream().map(w -> new Thread(w, "worker-" + p.name() + "-" + w.number)).toList();
 		try (ScheduledExecutorService status = Executors.newSingleThreadScheduledExecutor()) {
 			StatusPrinter printer = new StatusPrinter(p.name());
 			status.scheduleAtFixedRate(printer, 1, 1, TimeUnit.SECONDS);
@@ -291,16 +309,21 @@ public class Benchmark {
 		if (cfg.count() > 0 && c.committed() != cfg.count()) {
 			throw new IllegalStateException("expected " + cfg.count() + " commits, got " + c.committed());
 		}
-		appendCsv(cfg.csv(), "time,label,threads,opts,mode,seconds,commits,tps,read,insert,scan,write,retries,escalations",
-				String.format(Locale.ROOT, "%s,%s,%d,%s,%s,%.3f,%d,%.1f,%d,%d,%d,%d,%d,%d", LocalDateTime.now().withNano(0),
+		appendCsv(cfg.csv(), "time,label,threads,opts,mode,seconds,commits,tps,read,insert,scan,write,retries,escalations,version,seed,warmup",
+				String.format(Locale.ROOT, "%s,%s,%d,%s,%s,%.3f,%d,%.1f,%d,%d,%d,%d,%d,%d,2,%d,%d", LocalDateTime.now().withNano(0),
 						cfg.label(), cfg.threads(), cfg.optsString(), cfg.count() > 0 ? "count" : "duration", seconds,
 						c.committed(), tps, c.perType()[0], c.perType()[1], c.perType()[2], c.perType()[3],
-						c.retries(), c.escalations()));
+						c.retries(), c.escalations(), cfg.seed(), cfg.warmupSec()));
 	}
 
 	static synchronized void appendCsv(Path file, String header, String row) throws IOException {
 		if (file.getParent() != null) Files.createDirectories(file.getParent());
 		boolean fresh = !Files.exists(file) || Files.size(file) == 0;
+		if (!fresh) {
+			try (var reader = Files.newBufferedReader(file)) {
+				if (!header.equals(reader.readLine())) throw new IOException("CSV schema mismatch: " + file);
+			}
+		}
 		try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND))) {
 			if (fresh) w.println(header);
 			w.println(row);
@@ -308,8 +331,8 @@ public class Benchmark {
 	}
 
 	/**
-	 * Prints one status line per second. "in flight" = started - committed; it stays at the thread
-	 * count, which shows the closed loop is in equilibrium (no queue builds up, no worker idles).
+	 * Prints one status line per second. The atomic in-flight gauge counts tasks through output
+	 * completion and stays between zero and T, without races between separate commit counters.
 	 */
 	final class StatusPrinter implements Runnable {
 		final String phaseName;
@@ -323,15 +346,15 @@ public class Benchmark {
 			Counts now = stats.snapshot(), d = now.minus(last);
 			last = now;
 			second++;
-			long inFlight = now.started() - now.committed();
+			long inFlight = stats.active.get();
 			System.err.printf("[%-7s %3ds] %6d tx/s | read %5d insert %4d scan %4d write %5d | in flight %2d | retries %d exclusive %d%n",
 					phaseName, second, d.committed(), d.perType()[0], d.perType()[1], d.perType()[2], d.perType()[3],
 					inFlight, d.retries(), d.escalations());
 			if (cfg.timeline() == null) return;
 			try {
-				appendCsv(cfg.timeline(), "phase,second,tps,read,insert,scan,write,in_flight,retries,escalations",
-						String.format("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d", phaseName, second, d.committed(), d.perType()[0],
-								d.perType()[1], d.perType()[2], d.perType()[3], inFlight, d.retries(), d.escalations()));
+				appendCsv(cfg.timeline(), "phase,second,tps,read,insert,scan,write,in_flight,retries,escalations,threads,label,epoch_ms",
+						String.format("%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d", phaseName, second, d.committed(), d.perType()[0],
+								d.perType()[1], d.perType()[2], d.perType()[3], inFlight, d.retries(), d.escalations(), cfg.threads(), cfg.label(), System.currentTimeMillis()));
 			} catch (IOException e) {
 				System.err.println("timeline: " + e.getMessage());
 			}
@@ -347,9 +370,14 @@ public class Benchmark {
 		volatile Throwable failure;
 
 		Worker(int number) throws SQLException {
+			this(number, ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL));
+		}
+
+		Worker(int number, Connection connection) throws SQLException {
 			this.number = number;
-			this.con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
+			this.con = connection;
 			con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+			con.setClientInfo("ApplicationName", "adb-task-3-warmup");
 			if (cfg.opts().contains(Opt.ASYNC)) {
 				try (Statement st = con.createStatement()) {
 					st.execute("SET synchronous_commit = off");
@@ -373,6 +401,15 @@ public class Benchmark {
 
 		/** Runs a transaction until it commits; the same values are re-executed on every retry. */
 		void execute(Txn t) throws SQLException, InterruptedException {
+			stats.active.incrementAndGet();
+			try {
+				executeUntilCommitted(t);
+			} finally {
+				stats.active.decrementAndGet();
+			}
+		}
+
+		void executeUntilCommitted(Txn t) throws SQLException, InterruptedException {
 			stats.started.increment();
 			for (int attempt = 1; ; attempt++) {
 				try {
@@ -391,7 +428,8 @@ public class Benchmark {
 
 		/** One attempt. Returns the sum to print, or null for inserts and writes. */
 		Double runOnce(Txn t, boolean exclusive) throws SQLException {
-			boolean autocommit = cfg.opts().contains(Opt.AUTOCOMMIT) && t.type() != Type.WRITE;
+			boolean autocommit = useAutocommit(cfg.opts(), t.type());
+			con.setReadOnly(cfg.opts().contains(Opt.READONLY) && (t.type() == Type.READ || t.type() == Type.SCAN));
 			con.setAutoCommit(autocommit);
 			try {
 				Double result = switch (t.type()) {
@@ -422,7 +460,7 @@ public class Benchmark {
 
 		Double insertTxn(Txn t) throws SQLException {
 			PreparedStatement ps = statement(SQL_INSERT);
-			ps.setInt(1, nextInsertId.getAndIncrement()); // ids >= NUM_TUPLE; recreateTable() removes them again
+			ps.setInt(1, t.insertId()); // stable across scheduling and retries; reset removes warm-up inserts
 			ps.setDouble(2, t.values()[0]);
 			ps.setInt(3, t.id());
 			ps.executeUpdate();
@@ -488,6 +526,14 @@ public class Benchmark {
 		void backoff() throws InterruptedException {
 			// short random backoff: conflicts are only 3 rows wide now, so 1-10 ms is enough to break the tie
 			Thread.sleep(ThreadLocalRandom.current().nextInt(1, 11));
+		}
+
+		void resetAfterWarmup() throws SQLException {
+			if (!con.getAutoCommit()) con.rollback();
+			con.setAutoCommit(true);
+			con.setReadOnly(false);
+			for (PreparedStatement ps : preparedOnce.values()) ps.close();
+			preparedOnce.clear();
 		}
 
 		@Override
