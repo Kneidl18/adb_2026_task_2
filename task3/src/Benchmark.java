@@ -31,30 +31,20 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
-/**
- * Homework 3: throughput benchmark for the blocking_data workload (successor of Blocking / NoLiveLocks).
- *
- * <ul>
- *   <li>Workload: every transaction of the stream is a 3-point read (60 %), an insert (10 %), a full
- *       table scan (10 %) or a 3-row write (20 %), see {@link Txn#at}.</li>
- *   <li>Continuous stream: closed loop. Each of the T worker threads starts the next transaction of the
- *       stream as soon as its previous one committed, so at most T transactions are in flight.</li>
- *   <li>All transactions commit: deadlocks/serialization failures are retried with the same values;
- *       after {@link #MAX_RETRIES} aborts a write runs under an exclusive table lock (no starvation).</li>
- *   <li>Serial execution is the same code with {@code --threads 1}.</li>
- *   <li>Optimizations are switched on one by one with {@code --opt}, see {@link Opt}.</li>
- * </ul>
- *
- * Run {@code java Benchmark --help} for the flags.
+/*
+ * Throughput benchmark for homework 3.
+ * Generates reads, inserts, scans and updates with a 60/10/10/20 split.
+ * Each worker uses its own connection and processes one transaction at a time.
+ * Use --threads 1 for the serial baseline and --help for the available options.
  */
 public class Benchmark {
 
 	static final int NUM_TUPLE = 50_000;
 	static final double MAX_VALUE = 50.0;
 	static final int QUERIES_PER_TXN = 3;
-	/** after this many aborts a write takes an exclusive table lock, which bounds its restarts */
+	// After this many failures, take the table lock before updating any rows.
 	static final int MAX_RETRIES = 3;
-	/** warm-up draws from a far-away part of the stream, so the measured part always starts at index 0 */
+	// Use separate transaction numbers for warm-up; measurement starts at zero.
 	static final long WARMUP_STREAM_OFFSET = 1_000_000_000L;
 
 	static final String SQL_READ = "SELECT data_value FROM blocking_data WHERE data_id = ?";
@@ -68,23 +58,22 @@ public class Benchmark {
 		return opts.contains(Opt.AUTOCOMMIT) && (type == Type.INSERT || type == Type.SCAN);
 	}
 
-	/** The optimizations that can be switched on individually (ablation). */
+	// Optimizations that can be enabled individually.
 	enum Opt {
-		/** prepare each statement once per connection instead of once per transaction */
+		// prepare each statement once per connection instead of once per transaction
 		STMT,
-		/** buffer the console output instead of flushing every printed sum */
+		// buffer the console output instead of flushing every printed sum
 		PRINT,
-		/** single-statement INSERT/SCAN only; multi-point READ keeps its transaction boundary */
+		// single-statement INSERT/SCAN only; multi-point READ keeps its transaction boundary
 		AUTOCOMMIT,
-		/** mark READ/SCAN transactions read-only through JDBC */
+		// mark READ/SCAN transactions read-only through JDBC
 		READONLY,
-		/** synchronous_commit = off: a commit does not wait for the WAL flush */
+		// synchronous_commit = off: a commit does not wait for the WAL flush
 		ASYNC
 	}
 
-	/**
-	 * One transaction of the stream. It depends only on (seed, index), so every run and every execution
-	 * strategy works off exactly the same stream, and a retry re-executes the same values.
+	/*
+	 * The same seed and transaction number produce the same type, row IDs and values.
 	 */
 	record Txn(int id, Type type, int[] dataIds, double[] values) {
 		int insertId() { return Math.addExact(NUM_TUPLE, id); }
@@ -160,7 +149,7 @@ public class Benchmark {
 			  --timeline FILE write one row per second (for scripts/live_plot.py)
 			Sums of reads and scans go to stdout, status lines to stderr.""";
 
-	/** Commit counters and an atomic gauge for tasks currently being processed. */
+	// Commit counters and the number of transactions currently being processed.
 	static final class Stats {
 		final LongAdder started = new LongAdder();
 		final AtomicInteger active = new AtomicInteger();
@@ -184,7 +173,7 @@ public class Benchmark {
 		}
 	}
 
-	/** Which part of the stream a phase runs: indices [next, endIndex), stopping at deadline. */
+	// A phase stops starting transactions at its end index or deadline.
 	record Phase(String name, long endIndex, long deadlineNanos) {}
 
 	final Config cfg;
@@ -211,7 +200,7 @@ public class Benchmark {
 		}
 	}
 
-	/** A second benchmark would drop the table under the running one, so only one may run at a time. */
+	// A second benchmark would drop the table under the running one, so only one may run at a time.
 	static Connection holdSingleRunLock() throws SQLException {
 		Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
 		try (Statement st = con.createStatement(); ResultSet rs = st.executeQuery("SELECT pg_try_advisory_lock(3)")) {
@@ -233,7 +222,7 @@ public class Benchmark {
 				runPhase(workers, new Phase("warmup", Long.MAX_VALUE, deadline(cfg.warmupSec())));
 				out.flush();
 				for (Worker w : workers) w.resetAfterWarmup();
-				recreateTable(); // same seeded data, no warm-up inserts/updates/bloat in measurement
+				recreateTable(); // Reload the starting data so warm-up changes do not affect measurement.
 			}
 			if ("1".equals(System.getenv("BENCHMARK_ANALYZE"))) {
 				try (Statement st = workers.get(0).con.createStatement()) {
@@ -248,7 +237,7 @@ public class Benchmark {
 			Counts before = stats.snapshot();
 			long start = System.nanoTime();
 			runPhase(workers, measure);
-			out.flush(); // the output belongs to the transactions, so flushing it is measured too
+			out.flush(); // Include the final output flush in the measured time.
 			double seconds = (System.nanoTime() - start) / 1e9;
 			report(stats.snapshot().minus(before), seconds);
 		} finally {
@@ -260,7 +249,7 @@ public class Benchmark {
 		return System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
 	}
 
-	/** Drop, create and load the table, so every run starts without old inserts and without update bloat. */
+	// Drop, create and load the table, so every run starts without old inserts and without update bloat.
 	void recreateTable() throws SQLException {
 		try (Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
 			 Statement st = con.createStatement()) {
@@ -330,9 +319,8 @@ public class Benchmark {
 		}
 	}
 
-	/**
-	 * Prints one status line per second. The atomic in-flight gauge counts tasks through output
-	 * completion and stays between zero and T, without races between separate commit counters.
+	/*
+	 * Print progress once per second. A transaction stays active until its output is finished.
 	 */
 	final class StatusPrinter implements Runnable {
 		final String phaseName;
@@ -361,7 +349,7 @@ public class Benchmark {
 		}
 	}
 
-	/** One worker thread with its own connection (opened before the timer, reused for all its transactions). */
+	// One worker thread with its own connection (opened before the timer, reused for all its transactions).
 	final class Worker implements Runnable, AutoCloseable {
 		final int number;
 		final Connection con;
@@ -399,7 +387,7 @@ public class Benchmark {
 			}
 		}
 
-		/** Runs a transaction until it commits; the same values are re-executed on every retry. */
+		// Retry the same transaction so its IDs and values do not change.
 		void execute(Txn t) throws SQLException, InterruptedException {
 			stats.active.incrementAndGet();
 			try {
@@ -426,7 +414,7 @@ public class Benchmark {
 			}
 		}
 
-		/** One attempt. Returns the sum to print, or null for inserts and writes. */
+		// One attempt. Returns the sum to print, or null for inserts and writes.
 		Double runOnce(Txn t, boolean exclusive) throws SQLException {
 			boolean autocommit = useAutocommit(cfg.opts(), t.type());
 			con.setReadOnly(cfg.opts().contains(Opt.READONLY) && (t.type() == Type.READ || t.type() == Type.SCAN));
@@ -477,7 +465,7 @@ public class Benchmark {
 		Double writeTxn(Txn t, boolean exclusive) throws SQLException {
 			if (exclusive) lockTableExclusive();
 			PreparedStatement ps = statement(SQL_WRITE);
-			// order as generated, never sorted: the sheet forbids canonical lock ordering
+			// Keep the generated update order, as required by the assignment.
 			for (int q = 0; q < QUERIES_PER_TXN; q++) {
 				ps.setDouble(1, t.values()[q]);
 				ps.setInt(2, t.id());
@@ -487,7 +475,7 @@ public class Benchmark {
 			return null;
 		}
 
-		/** Escalation: blocks all other writers (readers still run), so this attempt cannot deadlock. */
+		// Block other writers before taking row locks. Ordinary reads can still run.
 		void lockTableExclusive() throws SQLException {
 			try (Statement st = con.createStatement()) {
 				st.execute("LOCK TABLE blocking_data IN EXCLUSIVE MODE");
@@ -524,7 +512,7 @@ public class Benchmark {
 		}
 
 		void backoff() throws InterruptedException {
-			// short random backoff: conflicts are only 3 rows wide now, so 1-10 ms is enough to break the tie
+			// Wait briefly before retrying to reduce repeated conflicts.
 			Thread.sleep(ThreadLocalRandom.current().nextInt(1, 11));
 		}
 
